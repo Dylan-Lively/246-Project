@@ -1,7 +1,7 @@
 import serial
 import keyboard
 
-ser = serial.Serial('COM3', 9600)
+ser = serial.Serial('COM4', 9600)
 
 prev1 = None
 prev2 = None
