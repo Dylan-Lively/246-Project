@@ -143,7 +143,7 @@ def unproject(norm_x, norm_y, depth_m):
     half_h = depth_m * np.tan(np.radians(CAM_FOV_V_DEG / 2))
 
     x_m =  cx * 2 * half_w    # left/right
-    y_m =  depth_m - 0.5      # forward/back centred at 0.5m
+    y_m =  0.5 - depth_m      # forward/back centred at 0.5m
     z_m = -cy * 2 * half_h    # up/down — flip so screen-down = negative
 
     return x_m, y_m, z_m

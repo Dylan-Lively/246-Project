@@ -432,13 +432,6 @@ bool parsePacket(const char *buf, char &prefix, float &x, float &y, float &z)
     p++;
     z = atof(p);
 
-    // if (x < 0.0f || x > 1.0f)
-    //     return false;
-    // if (y < 0.0f || y > 1.0f)
-    //     return false;
-    // if (z < 0.0f || z > 1.0f)
-    //     return false;
-
     return true;
 }
 
