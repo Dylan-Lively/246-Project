@@ -57,6 +57,7 @@ PALM_PAIRS = [
 GESTURE_PREFIX = {
     "Closed_Fist": "N",   # relative delta tracking
     "Victory":     "P",   # absolute IK snap
+    "ILoveYou": "M",
 }
 
 # ── Camera intrinsics ─────────────────────────────────────────────────────────
