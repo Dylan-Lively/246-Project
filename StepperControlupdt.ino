@@ -156,38 +156,18 @@ int serialBufIdx = 0;
 // ============================================================
 // UTILITIES
 // ============================================================
-long clampL(long val, long lo, long hi)
-{
-    if (val < lo)
-        return lo;
-    if (val > hi)
-        return hi;
-    return val;
-}
-
-float clampF(float val, float lo, float hi)
-{
-    if (val < lo)
-        return lo;
-    if (val > hi)
-        return hi;
-    return val;
-}
 
 long angleToStepsSafe(float angleDeg, float zeroOffsetDeg, float stepsPerDeg,
                       long minSteps, long maxSteps)
 {
-    long steps = (long)((angleDeg - zeroOffsetDeg) * stepsPerDeg);
+    return (long)roundf((angleDeg - zeroOffsetDeg) * stepsPerDeg);
+}
 
-    if (steps < minSteps || steps > maxSteps)
-    {
-        if (steps > maxSteps)
-            steps -= (long)(360.0f * stepsPerDeg);
-        else
-            steps += (long)(360.0f * stepsPerDeg);
-    }
-
-    return steps;
+bool angleInRange(float angleDeg, float zeroOffsetDeg, float stepsPerDeg,
+                  long minSteps, long maxSteps)
+{
+    long steps  = (long)roundf((angleDeg - zeroOffsetDeg) * stepsPerDeg);
+    return steps >= minSteps && steps <= maxSteps;
 }
 
 // ============================================================
@@ -222,6 +202,7 @@ bool solveIK(float px, float py, float pz,
 {
     // Base rotates to face target in XY plane
     baseAngle = atan2(py, px) * 180.0f / PI;
+    if (baseAngle >= 175.0f) baseAngle -= 360.0f;
 
     // Collapse to 2D — r is horizontal distance, h is height
     float r  = sqrt(px * px + py * py);
@@ -290,18 +271,35 @@ void moveToXYZ(float px, float py, float pz)
         Serial.println(pz, 3);
         return;
     }
+    else if (!angleInRange(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS)    ||
+             !angleInRange(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS) ||
+             !angleInRange(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS))
+    {
+      Serial.print("Out of bounds and unreachable: ");
+      Serial.print(px, 3);
+      Serial.print(" ");
+      Serial.print(py, 3);
+      Serial.print(" ");
+      Serial.println(pz, 3);
+      return;
+    }
 
     long baseSteps     = angleToStepsSafe(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS);
     long shoulderSteps = angleToStepsSafe(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
     long elbowSteps    = angleToStepsSafe(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS);
 
-    baseSteps = clampL(baseSteps, BASE_MIN_STEPS, BASE_MAX_STEPS);
-    shoulderSteps = clampL(shoulderSteps, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
-    elbowSteps = clampL(elbowSteps, ELBOW_MIN_STEPS, ELBOW_MAX_STEPS);
-
     base.moveTo(baseSteps);
     shoulder.moveTo(shoulderSteps);
     elbow.moveTo(elbowSteps);
+
+    float baseRad     = (baseSteps     / SPD_BASE     + BASE_ZERO_OFFSET)     * PI / 180.0f;
+    float shoulderRad = (shoulderSteps / SPD_SHOULDER + SHOULDER_ZERO_OFFSET) * PI / 180.0f;
+    float elbowRad    = (elbowSteps    / SPD_ELBOW    + ELBOW_ZERO_OFFSET)    * PI / 180.0f;
+
+    float r = L1 * cos(shoulderRad) + L2 * cos(shoulderRad - elbowRad);
+    tipX = r * cos(baseRad);
+    tipY = r * sin(baseRad);
+    tipZ = BASE_HEIGHT + L1 * sin(shoulderRad) + L2 * sin(shoulderRad - elbowRad);
 
     // Debug — comment out once verified
     Serial.print("ang ");
@@ -329,10 +327,6 @@ void handleRelative(float nx, float ny, float nz)
 {
     if (!prevInitialised)
     {
-        prevNX = nx;
-        prevNY = ny;
-        prevNZ = nz;
-        prevInitialised = true;
         return;
     }
 
@@ -365,7 +359,6 @@ void handleRelative(float nx, float ny, float nz)
 // is calculated from current hand position correctly.
 void handleHold()
 {
-    prevInitialised = false;
     base.moveTo(base.currentPosition());
     shoulder.moveTo(shoulder.currentPosition());
     elbow.moveTo(elbow.currentPosition());
@@ -381,6 +374,16 @@ void handleAbsolute(float nx, float ny, float nz)
     float armX = TIP_START_X + nx * SCALE_X;
     float armY = TIP_START_Y + ny * SCALE_Y;
     float armZ = TIP_START_Z + nz * SCALE_Z;
+
+    moveToXYZ(armX, armY, armZ);
+}
+
+void handleMirror(float nx, float ny, float nz)
+{
+
+    float armX = TIP_START_X - nx * SCALE_X;
+    float armY = TIP_START_Y - ny * SCALE_Y;
+    float armZ = TIP_START_Z - nz * SCALE_Z;
 
     moveToXYZ(armX, armY, armZ);
 }
@@ -509,11 +512,15 @@ void loop()
                 case 'P':
                     handleAbsolute(x, y , z);
                     break;
+                case 'M':
+                    handleMirror(x, y, z);
+                    break;
                 default:
                     Serial.print("Unknown prefix: ");
                     Serial.println(prefix);
                     break;
                 }
+                prevInitialised = true;
                 prevNX = x;
                 prevNY = y;
                 prevNZ = z;
