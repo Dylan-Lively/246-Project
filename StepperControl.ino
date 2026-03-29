@@ -1,346 +1,534 @@
 /*
-  3DOF Arm Controller — IK, no limit switches
-  =============================================
-  - Power on with arm in its neutral/home position
-  - That position becomes step zero for all axes
-  - Bounds enforced via step counter (Arduino) and
-    normalised XYZ clamp (Python side)
-  - No homing routine needed
+  3DOF Arm Controller
+  ====================
+  Starting position: shoulder straight up, forearm pointing right (L shape).
+  That position is step zero and virtual tip origin.
 
-  Serial protocol:  "X:0.623,Y:0.441,Z:0.318\n"  (normalised 0.0-1.0)
-  Requires:         AccelStepper (Library Manager)
+  Coordinate convention (same on both sides, no flipping on Arduino):
+      X = left/right      (positive = right)
+      Y = forward/back    (positive = away from base)
+      Z = up/down         (positive = up)
+
+  Python handles the MediaPipe → arm space conversion before sending.
+  Arduino just receives arm-space XYZ and uses them directly.
+
+  Serial protocol:
+      N:0.623,0.441,0.318   relative delta tracking (closed fist)
+      P:0.623,0.441,0.318   absolute IK snap        (peace)
+      F:0.623,0.441,0.318   hold position           (anything else)
+
+  Requires: AccelStepper (Library Manager)
 */
 
 #include <AccelStepper.h>
 #include <math.h>
 
 // ============================================================
-// PIN ASSIGNMENTS
+// PINS
 // ============================================================
-#define BASE_STEP_PIN       4
-#define BASE_DIR_PIN        7
-#define SHOULDER_STEP_PIN   2
-#define SHOULDER_DIR_PIN    5
-#define ELBOW_STEP_PIN      3
-#define ELBOW_DIR_PIN       6
+#define BASE_STEP_PIN 4
+#define BASE_DIR_PIN 7
+#define SHOULDER_STEP_PIN 2
+#define SHOULDER_DIR_PIN 5
+#define ELBOW_STEP_PIN 3
+#define ELBOW_DIR_PIN 6
 
 // ============================================================
-// PHYSICAL CONSTANTS — fill these in
+// PHYSICAL CONSTANTS
 // ============================================================
 
-const float L1          = 0.24;     // shoulder axis to elbow axis (metres)
-const float L2          = 0.195;    // elbow axis to tip (metres)
-const float BASE_HEIGHT = 0.055;    // shoulder axis height above base origin (metres)
+// Link lengths (metres, axis to axis)
+const float L1 = 0.240; // shoulder to elbow
+const float L2 = 0.195; // elbow to tip
 
-// Hand workspace in real metres — what volume does your hand move in?
-// Laptop sends 0.0-1.0, this maps that to metres for the IK solver.
-const float HAND_X_MIN = 0.0;
-const float HAND_X_MAX =  1.0;
-const float HAND_Y_MIN =  0.0;
-const float HAND_Y_MAX =  1.0;
-const float HAND_Z_MIN =  0.0;
-const float HAND_Z_MAX =  1.0;
+// Height of shoulder axis above base pivot (metres)
+const float BASE_HEIGHT = 0.0;
 
-// Motor and drive constants
-const int   STEPS_PER_REV       = 200;   // 200 for 1.8 degree steppers
+// Virtual tip at L position (metres from base pivot)
+// Shoulder straight up, forearm pointing right:
+//   X = L2   (forearm extends along X axis to the right)
+//   Y = 0    (no forward/back offset)
+//   Z = L1   (upper arm goes straight up)
+const float TIP_START_X = 0.195;
+const float TIP_START_Y = 0.0;
+const float TIP_START_Z = 0.240;
 
-const int   MICROSTEPS_BASE     = 1;     // match your driver MS pin settings
-const int   MICROSTEPS_SHOULDER = 1;
-const int   MICROSTEPS_ELBOW    = 1;
+// Scale: metres of tip travel per full normalised unit (0.0 to 1.0)
+// 0.2 = full hand box width moves tip 0.2m. Tune by feel.
+const float SCALE_X = 0.2;
+const float SCALE_Y = 0.2;
+const float SCALE_Z = 0.2;
 
-const float GEAR_RATIO_BASE     = 19.3;  // 1.0 = direct drive
+// Delta threshold — normalised units treated as stillness.
+// Prevents arm tremor from hand noise. Tune 0.005 to 0.02.
+const float DELTA_THRESHOLD = 0.008;
+
+// ============================================================
+// MOTOR AND DRIVE
+// ============================================================
+const int STEPS_PER_REV = 200;
+
+const float GEAR_RATIO_BASE = 19.3;
 const float GEAR_RATIO_SHOULDER = 18.0;
-const float GEAR_RATIO_ELBOW    = 21.0;
+const float GEAR_RATIO_ELBOW = 21.0;
 
 // Zero offsets (degrees)
-// When the motor is at step 0 (power-on position), what angle is
-// the joint physically at in the IK reference frame?
-// IK reference: shoulder 0 = horizontal, elbow 0 = fully extended
-const float BASE_ZERO_OFFSET     = 0.0;
+// What angle is each joint physically at when at step 0 (L position)?
+// IK reference frame: shoulder 0 = horizontal, elbow 0 = fully extended
+// L position: shoulder is vertical = 90deg, elbow is 90deg bent
+const float BASE_ZERO_OFFSET = 0.0;
 const float SHOULDER_ZERO_OFFSET = 90.0;
-const float ELBOW_ZERO_OFFSET    = 0.0;
+const float ELBOW_ZERO_OFFSET = 90.0;
 
 // ============================================================
-// AXIS BOUNDS (steps from power-on position)
-// No limit switches — you define the safe travel range manually.
-// Power on with arm in neutral position, these are the max steps
-// it can move in either direction from there.
-// Negative = one direction, positive = other direction.
-// Start conservative, widen once verified safe.
+// AXIS BOUNDS (steps from L position)
 // ============================================================
-const long BASE_MIN_STEPS      = -965;
-const long BASE_MAX_STEPS      =  1930;
+const long BASE_MIN_STEPS = -1930;
+const long BASE_MAX_STEPS = 965;
 
-const long SHOULDER_MIN_STEPS  = -450;
-const long SHOULDER_MAX_STEPS  =  450;
+const long SHOULDER_MIN_STEPS = -300;
+const long SHOULDER_MAX_STEPS = 300;
 
-const long ELBOW_MIN_STEPS     = -2625;
-const long ELBOW_MAX_STEPS     =  525;
+const long ELBOW_MIN_STEPS = -2450;
+const long ELBOW_MAX_STEPS = 350;
 
 // ============================================================
-// MOTION PARAMETERS — start slow, increase gradually
-// If a motor stalls or misses steps, reduce speed first
+// MOTION PARAMETERS
 // ============================================================
-const float BASE_MAX_SPEED      = 400.0;
-const float BASE_ACCEL          = 200.0;
+const float BASE_MAX_SPEED = 400.0;
+const float BASE_ACCEL = 200.0;
 
-const float SHOULDER_MAX_SPEED  = 300.0;
-const float SHOULDER_ACCEL      = 150.0;
+const float SHOULDER_MAX_SPEED = 300.0;
+const float SHOULDER_ACCEL = 150.0;
 
-const float ELBOW_MAX_SPEED     = 300.0;
-const float ELBOW_ACCEL         = 150.0;
+const float ELBOW_MAX_SPEED = 300.0;
+const float ELBOW_ACCEL = 150.0;
 
 // ============================================================
 // SERIAL
 // ============================================================
-#define SERIAL_BAUD         115200
-#define SERIAL_TIMEOUT_MS   500     // hold position if no packet for this long
+#define SERIAL_BAUD 115200
+#define SERIAL_TIMEOUT_MS 500
 
 // ============================================================
-// DERIVED — computed in setup() from constants above
-// steps_per_degree = (STEPS_PER_REV x MICROSTEPS x GEAR_RATIO) / 360
+// DERIVED — computed in setup()
 // ============================================================
-float SPD_BASE     = 0.0;
+float SPD_BASE = 0.0;
 float SPD_SHOULDER = 0.0;
-float SPD_ELBOW    = 0.0;
+float SPD_ELBOW = 0.0;
 
 // ============================================================
-// STEPPER OBJECTS
+// STEPPERS
 // ============================================================
-AccelStepper base    (AccelStepper::DRIVER, BASE_STEP_PIN,     BASE_DIR_PIN);
+AccelStepper base(AccelStepper::DRIVER, BASE_STEP_PIN, BASE_DIR_PIN);
 AccelStepper shoulder(AccelStepper::DRIVER, SHOULDER_STEP_PIN, SHOULDER_DIR_PIN);
-AccelStepper elbow   (AccelStepper::DRIVER, ELBOW_STEP_PIN,    ELBOW_DIR_PIN);
+AccelStepper elbow(AccelStepper::DRIVER, ELBOW_STEP_PIN, ELBOW_DIR_PIN);
+
+// ============================================================
+// VIRTUAL TIP
+// Arm's believed tip position in arm space (metres).
+// Starts at L position. All modes update this.
+// ============================================================
+float tipX = TIP_START_X;
+float tipY = TIP_START_Y;
+float tipZ = TIP_START_Z;
+
+// Previous normalised hand coords for delta calculation
+bool prevInitialised = false;
+float prevNX = 0.5;
+float prevNY = 0.5;
+float prevNZ = 0.5;
 
 // ============================================================
 // STATE
 // ============================================================
-enum State { STATE_RUNNING, STATE_TIMEOUT };
+enum State
+{
+    STATE_RUNNING,
+    STATE_TIMEOUT
+};
 State currentState = STATE_RUNNING;
 unsigned long lastPacketTime = 0;
 
 char serialBuf[64];
-int  serialBufIdx = 0;
+int serialBufIdx = 0;
 
 // ============================================================
 // UTILITIES
 // ============================================================
-long clampL(long val, long lo, long hi) {
-  if (val < lo) return lo;
-  if (val > hi) return hi;
-  return val;
+long clampL(long val, long lo, long hi)
+{
+    if (val < lo)
+        return lo;
+    if (val > hi)
+        return hi;
+    return val;
 }
 
-float normToReal(float norm, float minVal, float maxVal) {
-  norm = constrain(norm, 0.0f, 1.0f);
-  return minVal + (maxVal - minVal) * norm;
+float clampF(float val, float lo, float hi)
+{
+    if (val < lo)
+        return lo;
+    if (val > hi)
+        return hi;
+    return val;
 }
 
-long angleToSteps(float angleDeg, float zeroOffsetDeg, float stepsPerDeg) {
-  return (long)((angleDeg - zeroOffsetDeg) * stepsPerDeg);
+long angleToSteps(float angleDeg, float zeroOffsetDeg, float stepsPerDeg)
+{
+    return (long)((angleDeg - zeroOffsetDeg) * stepsPerDeg);
 }
 
 // ============================================================
 // INVERSE KINEMATICS
 //
-// Joint layout: base (yaw) + shoulder (pitch) + elbow (pitch)
+// All inputs and outputs are in consistent arm space:
+//   X = left/right, Y = forward/back, Z = up/down
 //
 // Base:
-//   baseAngle = atan2(py, px)
-//   — rotates to face hand in horizontal plane
+//   Rotates to face target in horizontal (XY) plane.
+//   atan2(px, py) — base homes facing down Y, X is lateral deviation.
+//   If base homes facing right (down X), swap to atan2(py, px).
 //
-// Collapse to 2D:
-//   r = sqrt(px^2 + py^2)      horizontal distance from base axis
-//   h = pz - BASE_HEIGHT        height relative to shoulder axis
+// Collapse to 2D vertical plane:
+//   r = sqrt(px^2 + py^2)   horizontal distance from base axis
+//   h = pz - BASE_HEIGHT     height relative to shoulder axis
 //
-// Elbow — law of cosines:
+// Elbow via law of cosines:
 //   D^2 = r^2 + h^2
 //   cos(elbow) = (D^2 - L1^2 - L2^2) / (2 * L1 * L2)
-//   elbowAngle = acos(cos(elbow))
+//   elbow = acos(cos(elbow))
 //
 // Shoulder:
-//   alpha = atan2(h, r)                               angle up to target
-//   beta  = atan2(L2*sin(elbow), L1 + L2*cos(elbow)) elbow correction
-//   shoulderAngle = alpha - beta
+//   alpha = atan2(h, r)
+//   beta  = atan2(L2 * sin(elbow), L1 + L2 * cos(elbow))
+//   shoulder = alpha - beta
 //
 // Returns false if target is outside reachable workspace
 // ============================================================
-bool solveIK(float px, float py, float pz, float &baseAngle, float &shoulderAngle, float &elbowAngle) {
+bool solveIK(float px, float py, float pz,
+             float &baseAngle, float &shoulderAngle, float &elbowAngle)
+{
 
-  baseAngle = atan2(py, px) * 180.0f / PI;
+    // Base homes facing right (down X axis) since forearm starts pointing right
+    // so lateral deviation is Y, and atan2(py, px) gives correct rotation
+    baseAngle = atan2(py, px) * 180.0f / PI;
 
-  float r  = sqrt(px * px + py * py);
-  float h  = pz - BASE_HEIGHT;
-  float D2 = r * r + h * h;
-  float D  = sqrt(D2);
+    float r = sqrt(px * px + py * py);
+    float h = pz - BASE_HEIGHT;
+    float D2 = r * r + h * h;
+    float D = sqrt(D2);
 
-  // Check reachability
-  if (D > (L1 + L2) || D < fabs(L1 - L2)) {
-    return false;
-  }
-
-  float cosElbow = (D2 - L1 * L1 - L2 * L2) / (2.0f * L1 * L2);
-  cosElbow   = constrain(cosElbow, -1.0f, 1.0f);
-  elbowAngle = acos(cosElbow) * 180.0f / PI;
-
-  float elbowRad = elbowAngle * PI / 180.0f;
-  float alpha    = atan2(h, r);
-  float beta     = atan2(L2 * sin(elbowRad), L1 + L2 * cos(elbowRad));
-  shoulderAngle  = (alpha - beta) * 180.0f / PI;
-
-  return true;
-}
-
-// ============================================================
-// SERIAL — non-blocking character-by-character reader
-// Accumulates into serialBuf, returns true on complete line
-// ============================================================
-bool readSerialLine() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '\n') {
-      serialBuf[serialBufIdx] = '\0';
-      serialBufIdx = 0;
-      return true;
+    if (D > (L1 + L2) || D < fabs(L1 - L2))
+    {
+        return false;
     }
-    // Strip carriage return (handles \r\n line endings from some senders)
-    if (c == '\r') continue;
-    if (serialBufIdx < (int)sizeof(serialBuf) - 1)
-      serialBuf[serialBufIdx++] = c;
-    else
-      serialBufIdx = 0;   // overflow — reset and wait for next packet
-  }
-  return false;
-}
 
-// FIX: sscanf with %f is unreliable on AVR. Parse manually using atof() instead.
-bool parsePacket(const char* buf, float &x, float &y, float &z) {
-  // Expected format: "X:0.623,Y:0.441,Z:0.318"
-  const char* p = buf;
+    float cosElbow = (D2 - L1 * L1 - L2 * L2) / (2.0f * L1 * L2);
+    cosElbow = constrain(cosElbow, -1.0f, 1.0f);
+    elbowAngle = acos(cosElbow) * 180.0f / PI;
 
-  if (p[0] != 'X' || p[1] != ':') return false;
-  p += 2;
-  x = atof(p);
+    float elbowRad = elbowAngle * PI / 180.0f;
+    float alpha = atan2(h, r);
+    float beta = atan2(L2 * sin(elbowRad), L1 + L2 * cos(elbowRad));
+    shoulderAngle = (alpha - beta) * 180.0f / PI;
 
-  p = strchr(p, ',');
-  if (!p) return false;
-  p++;
-  if (p[0] != 'Y' || p[1] != ':') return false;
-  p += 2;
-  y = atof(p);
-
-  p = strchr(p, ',');
-  if (!p) return false;
-  p++;
-  if (p[0] != 'Z' || p[1] != ':') return false;
-  p += 2;
-  z = atof(p);
-
-  // Sanity check — values must be in normalised range
-  if (x < 0.0f || x > 1.0f) return false;
-  if (y < 0.0f || y > 1.0f) return false;
-  if (z < 0.0f || z > 1.0f) return false;
-
-  return true;
+    return true;
 }
 
 // ============================================================
-// APPLY TARGET
-// Normalised XYZ -> real metres -> IK angles -> steps -> moveTo
+// MOVE TO XYZ
+// All modes call this. Takes a target in arm space (metres),
+// runs IK, converts to steps, clamps, commands motors.
 // ============================================================
-void applyTarget(float nx, float ny, float nz) {
+void moveToXYZ(float px, float py, float pz)
+{
+    float baseAng, shoulderAng, elbowAng;
 
-  float px = normToReal(nx, HAND_X_MIN, HAND_X_MAX);
-  float py = normToReal(ny, HAND_Y_MIN, HAND_Y_MAX);
-  float pz = normToReal(nz, HAND_Z_MIN, HAND_Z_MAX);
+    if (!solveIK(px, py, pz, baseAng, shoulderAng, elbowAng))
+    {
+        Serial.print("IK unreachable: ");
+        Serial.print(px, 3);
+        Serial.print(" ");
+        Serial.print(py, 3);
+        Serial.print(" ");
+        Serial.println(pz, 3);
+        return;
+    }
 
-  float baseAng, shoulderAng, elbowAng;
-  if (!solveIK(px, py, pz, baseAng, shoulderAng, elbowAng)) {
-    Serial.print("IK FAILED px="); Serial.print(px, 3);
-    Serial.print(" py=");           Serial.print(py, 3);
-    Serial.print(" pz=");           Serial.println(pz, 3);
-    return;
-  }
+    long baseSteps = angleToSteps(baseAng, BASE_ZERO_OFFSET, SPD_BASE);
+    long shoulderSteps = angleToSteps(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER);
+    long elbowSteps = angleToSteps(elbowAng, ELBOW_ZERO_OFFSET, SPD_ELBOW);
 
-  long baseSteps     = angleToSteps(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE);
-  long shoulderSteps = angleToSteps(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER);
-  long elbowSteps    = angleToSteps(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW);
+    baseSteps = clampL(baseSteps, BASE_MIN_STEPS, BASE_MAX_STEPS);
+    shoulderSteps = clampL(shoulderSteps, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
+    elbowSteps = clampL(elbowSteps, ELBOW_MIN_STEPS, ELBOW_MAX_STEPS);
 
-  // Clamp to safe travel range — primary protection since no limit switches
-  baseSteps     = clampL(baseSteps,     BASE_MIN_STEPS,     BASE_MAX_STEPS);
-  shoulderSteps = clampL(shoulderSteps, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
-  elbowSteps    = clampL(elbowSteps,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS);
+    base.moveTo(baseSteps);
+    shoulder.moveTo(shoulderSteps);
+    elbow.moveTo(elbowSteps);
 
-  base.moveTo(baseSteps);
-  shoulder.moveTo(shoulderSteps);
-  elbow.moveTo(elbowSteps);
+    // Debug — comment out once verified
+    Serial.print("ang ");
+    Serial.print(baseAng, 1);
+    Serial.print(" ");
+    Serial.print(shoulderAng, 1);
+    Serial.print(" ");
+    Serial.println(elbowAng, 1);
+    Serial.print("stp ");
+    Serial.print(baseSteps);
+    Serial.print(" ");
+    Serial.print(shoulderSteps);
+    Serial.print(" ");
+    Serial.println(elbowSteps);
+}
+
+// ============================================================
+// MODE HANDLERS
+// ============================================================
+
+// N — relative delta tracking
+// Accumulates scaled deltas into virtual tip, calls moveToXYZ.
+// No axis flipping here — Python already sent arm-space coords.
+void handleRelative(float nx, float ny, float nz)
+{
+
+    if (!prevInitialised)
+    {
+        prevNX = nx;
+        prevNY = ny;
+        prevNZ = nz;
+        prevInitialised = true;
+        return;
+    }
+
+    float dx = nx - prevNX;
+    float dy = ny - prevNY;
+    float dz = nz - prevNZ;
+
+    // Scale normalised deltas to metres
+    float armDX = dx * SCALE_X;
+    float armDY = dy * SCALE_Y;
+    float armDZ = dz * SCALE_Z;
+
+    // Deadband — ignore sub-threshold movement
+    if (fabs(armDX) < DELTA_THRESHOLD * SCALE_X)
+        armDX = 0.0f;
+    if (fabs(armDY) < DELTA_THRESHOLD * SCALE_Y)
+        armDY = 0.0f;
+    if (fabs(armDZ) < DELTA_THRESHOLD * SCALE_Z)
+        armDZ = 0.0f;
+
+    // Accumulate into virtual tip
+    tipX += armDX;
+    tipY += armDY;
+    tipZ += armDZ;
+
+    // Clamp virtual tip to reachable envelope
+    float reach = (L1 + L2) * 0.9f;
+    tipX = clampF(tipX, -reach, reach);
+    tipY = clampF(tipY, 0.01f, reach);
+    tipZ = clampF(tipZ, BASE_HEIGHT, L1 + L2 + BASE_HEIGHT);
+
+    moveToXYZ(tipX, tipY, tipZ);
+
+    // Always update prev — even if delta was zeroed by deadband
+    prevNX = nx;
+    prevNY = ny;
+    prevNZ = nz;
+}
+
+// F — hold position
+// Do not update prev — when tracking resumes, first delta
+// is calculated from current hand position correctly.
+void handleHold()
+{
+    prevInitialised = false;
+    base.moveTo(base.currentPosition());
+    shoulder.moveTo(shoulder.currentPosition());
+    elbow.moveTo(elbow.currentPosition());
+}
+
+// P — absolute IK snap
+// Maps hand position directly to arm space.
+// Centre of hand box (0.5) maps to arm L position (TIP_START).
+// Syncs virtual tip and prev so delta resumes correctly after snap.
+void handleAbsolute(float nx, float ny, float nz)
+{
+
+    float armX = TIP_START_X + (nx - 0.5f) * SCALE_X;
+    float armY = TIP_START_Y + (ny - 0.5f) * SCALE_Y;
+    float armZ = TIP_START_Z + (nz - 0.5f) * SCALE_Z;
+
+    moveToXYZ(armX, armY, armZ);
+
+    // Sync virtual tip and prev so delta resumes from here
+    tipX = armX;
+    tipY = armY;
+    tipZ = armZ;
+
+    prevNX = nx;
+    prevNY = ny;
+    prevNZ = nz;
+}
+
+// ============================================================
+// SERIAL
+// ============================================================
+bool readSerialLine()
+{
+    while (Serial.available() > 0)
+    {
+        char c = Serial.read();
+        if (c == '\n')
+        {
+            serialBuf[serialBufIdx] = '\0';
+            serialBufIdx = 0;
+            return true;
+        }
+        if (c == '\r')
+            continue;
+        if (serialBufIdx < (int)sizeof(serialBuf) - 1)
+            serialBuf[serialBufIdx++] = c;
+        else
+            serialBufIdx = 0;
+    }
+    return false;
+}
+
+// Parse "N:0.623,0.441,0.318"
+bool parsePacket(const char *buf, char &prefix, float &x, float &y, float &z)
+{
+    if (strlen(buf) < 3)
+        return false;
+    if (buf[1] != ':')
+        return false;
+
+    prefix = buf[0];
+
+    const char *p = buf + 2;
+    x = atof(p);
+    p = strchr(p, ',');
+    if (!p)
+        return false;
+    p++;
+    y = atof(p);
+    p = strchr(p, ',');
+    if (!p)
+        return false;
+    p++;
+    z = atof(p);
+
+    if (x < 0.0f || x > 1.0f)
+        return false;
+    if (y < 0.0f || y > 1.0f)
+        return false;
+    if (z < 0.0f || z > 1.0f)
+        return false;
+
+    return true;
 }
 
 // ============================================================
 // SETUP
 // ============================================================
-void setup() {
-  Serial.begin(SERIAL_BAUD);
+void setup()
+{
+    Serial.begin(SERIAL_BAUD);
 
-  // Steps per degree for each axis
-  SPD_BASE     = (STEPS_PER_REV * MICROSTEPS_BASE     * GEAR_RATIO_BASE)     / 360.0f;
-  SPD_SHOULDER = (STEPS_PER_REV * MICROSTEPS_SHOULDER * GEAR_RATIO_SHOULDER) / 360.0f;
-  SPD_ELBOW    = (STEPS_PER_REV * MICROSTEPS_ELBOW    * GEAR_RATIO_ELBOW)    / 360.0f;
+    SPD_BASE = (STEPS_PER_REV * GEAR_RATIO_BASE) / 360.0f;
+    SPD_SHOULDER = (STEPS_PER_REV * GEAR_RATIO_SHOULDER) / 360.0f;
+    SPD_ELBOW = (STEPS_PER_REV * GEAR_RATIO_ELBOW) / 360.0f;
 
-  Serial.print("SPD base="); Serial.print(SPD_BASE);
-  Serial.print(" sh=");      Serial.print(SPD_SHOULDER);
-  Serial.print(" el=");      Serial.println(SPD_ELBOW);
+    Serial.print("SPD base=");
+    Serial.print(SPD_BASE, 3);
+    Serial.print(" sh=");
+    Serial.print(SPD_SHOULDER, 3);
+    Serial.print(" el=");
+    Serial.println(SPD_ELBOW, 3);
 
-  // All axes start at 0 — arm must be in neutral position at power-on
-  base.setCurrentPosition(0);
-  shoulder.setCurrentPosition(0);
-  elbow.setCurrentPosition(0);
+    Serial.print("TIP start X=");
+    Serial.print(TIP_START_X, 3);
+    Serial.print(" Y=");
+    Serial.print(TIP_START_Y, 3);
+    Serial.print(" Z=");
+    Serial.println(TIP_START_Z, 3);
 
-  base.setMaxSpeed(BASE_MAX_SPEED);         base.setAcceleration(BASE_ACCEL);
-  shoulder.setMaxSpeed(SHOULDER_MAX_SPEED); shoulder.setAcceleration(SHOULDER_ACCEL);
-  elbow.setMaxSpeed(ELBOW_MAX_SPEED);       elbow.setAcceleration(ELBOW_ACCEL);
+    base.setCurrentPosition(0);
+    shoulder.setCurrentPosition(0);
+    elbow.setCurrentPosition(0);
 
-  lastPacketTime = millis();
-  Serial.println("Ready — move arm to neutral before sending commands.");
+    base.setMaxSpeed(BASE_MAX_SPEED);
+    base.setAcceleration(BASE_ACCEL);
+    shoulder.setMaxSpeed(SHOULDER_MAX_SPEED);
+    shoulder.setAcceleration(SHOULDER_ACCEL);
+    elbow.setMaxSpeed(ELBOW_MAX_SPEED);
+    elbow.setAcceleration(ELBOW_ACCEL);
+
+    lastPacketTime = millis();
+    Serial.println("Ready. Arm must be in L position at power on.");
 }
 
 // ============================================================
-// LOOP — no delay() anywhere, run() must execute every iteration
+// LOOP — no delay() anywhere
 // ============================================================
-void loop() {
+void loop()
+{
 
-  if (readSerialLine()) {
-    float x, y, z;
-    if (parsePacket(serialBuf, x, y, z)) {
-      lastPacketTime = millis();
+    if (readSerialLine())
+    {
+        char prefix;
+        float x, y, z;
 
-      if (currentState == STATE_TIMEOUT) {
-        currentState = STATE_RUNNING;
-        Serial.println("Signal restored.");
-      }
+        if (parsePacket(serialBuf, prefix, x, y, z))
+        {
+            lastPacketTime = millis();
 
-      if (currentState == STATE_RUNNING) {
-        applyTarget(x, y, z);
-      }
-    } else {
-      Serial.print("Parse failed: [");
-      Serial.print(serialBuf);
-      Serial.println("]");
+            if (currentState == STATE_TIMEOUT)
+            {
+                currentState = STATE_RUNNING;
+                Serial.println("Signal restored.");
+            }
+
+            if (currentState == STATE_RUNNING)
+            {
+                switch (prefix)
+                {
+                case 'N':
+                    handleRelative(x, y, z);
+                    break;
+                case 'F':
+                    handleHold();
+                    break;
+                case 'P':
+                    handleAbsolute(x, y, z);
+                    break;
+                default:
+                    Serial.print("Unknown prefix: ");
+                    Serial.println(prefix);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            Serial.print("Parse failed: [");
+            Serial.print(serialBuf);
+            Serial.println("]");
+        }
     }
-  }
 
-  // No packet for SERIAL_TIMEOUT_MS — stop where we are
-  if (currentState == STATE_RUNNING &&
-      (millis() - lastPacketTime) > SERIAL_TIMEOUT_MS) {
-    currentState = STATE_TIMEOUT;
-    base.moveTo(base.currentPosition());
-    shoulder.moveTo(shoulder.currentPosition());
-    elbow.moveTo(elbow.currentPosition());
-    Serial.println("Signal lost — holding position.");
-  }
+    if (currentState == STATE_RUNNING &&
+        (millis() - lastPacketTime) > SERIAL_TIMEOUT_MS)
+    {
+        currentState = STATE_TIMEOUT;
+        base.moveTo(base.currentPosition());
+        shoulder.moveTo(shoulder.currentPosition());
+        elbow.moveTo(elbow.currentPosition());
+        Serial.println("Signal lost — holding.");
+    }
 
-  // These three lines are doing all the real work.
-  // Every loop iteration each motor gets a chance to step.
-  base.run();
-  shoulder.run();
-  elbow.run();
+    base.run();
+    shoulder.run();
+    elbow.run();
 }

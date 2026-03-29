@@ -1,20 +1,20 @@
 """
 Hand Tracker → Arduino Serial
 ==============================
-Detects gesture and sends prefix + arm-space XYZ to Arduino.
+Detects gesture and sends prefix + real-world XYZ metres to Arduino.
+
+Coordinate system (origin = centre of screen at 0.5m depth):
+    X: left/right  (negative = left,  positive = right)
+    Y: depth       (0 = camera,  centred so 0.5m depth = 0.0)
+    Z: up/down     (negative = down,  positive = up)
 
 Gesture mapping:
     Closed_Fist  → N  (relative delta tracking)
     Victory      → P  (absolute IK snap)
     anything else → F  (hold)
 
-Coordinate convention (converted to arm space before sending):
-    Arm X = hand left/right       (MediaPipe X, same direction)
-    Arm Y = hand forward/back     (MediaPipe Z flipped: closer = more negative MP Z)
-    Arm Z = hand up/down          (MediaPipe Y flipped: MP Y=0 is top of frame)
-
-Serial format:  "N:0.623,0.441,0.318\n"
-                 ^ prefix
+Serial format:  "N:0.1230,-0.0420,0.0318\n"
+                 ^ prefix  ^ x      ^ y      ^ z  (all metres)
 
 Install:  pip install mediapipe opencv-python numpy pyserial
 Run:      python hand_trackerupdt.py --port COM4
@@ -59,6 +59,18 @@ GESTURE_PREFIX = {
     "Victory":     "P",   # absolute IK snap
 }
 
+# ── Camera intrinsics ─────────────────────────────────────────────────────────
+# Measured: at 0.5m depth frame was 0.80m wide, 0.46m tall
+# FOV_H = 2 * atan(0.40 / 0.50) = 77.3°
+# FOV_V = 2 * atan(0.23 / 0.50) = 49.8°
+CAM_FOV_H_DEG = 77.3
+CAM_FOV_V_DEG = 49.8
+
+# ── Depth clamp (metres) ──────────────────────────────────────────────────────
+# Hand tracking disappears below ~0.20m so floor at 0.10m
+DEPTH_MIN = 0.10
+DEPTH_MAX = 1.00
+
 # ── Config ───────────────────────────────────────────────────────────────────────
 SERIAL_BAUD  = 115200
 SEND_HZ      = 20
@@ -66,18 +78,10 @@ SEND_HZ      = 20
 # EMA smoothing alpha per axis. Lower = smoother, laggier.
 SMOOTH_ALPHA = 0.25
 
-# Deadband — minimum change in any axis before sending.
-# Applied after coordinate conversion, in normalised 0-1 units.
-DEADBAND = 0.008
-
-# Depth (Z) working range in metres.
-# Hand at Z_NEAR → normalised 0.0
-# Hand at Z_FAR  → normalised 1.0
-Z_NEAR = 0.25
-Z_FAR  = 0.80
+# Deadband — minimum change in any axis before sending (metres).
+DEADBAND = 0.005
 
 # Gesture smoothing — majority vote over this many frames
-# Prevents single-frame misdetections from switching modes
 GESTURE_BUF_LEN = 7
 
 font = cv2.FONT_HERSHEY_SIMPLEX
@@ -85,7 +89,7 @@ font = cv2.FONT_HERSHEY_SIMPLEX
 
 # ── Depth estimation ─────────────────────────────────────────────────────────────
 def estimate_depth(lm, img_w, img_h):
-    focal = img_w / (2 * np.tan(np.radians(35)))
+    focal = img_w / (2 * np.tan(np.radians(31.5)))
     depths = []
     for a, b, real_m in PALM_PAIRS:
         px = np.hypot((lm[a].x - lm[b].x) * img_w,
@@ -106,19 +110,23 @@ def palm_center_norm(lm, img_w, img_h):
     return float(c[0] / img_w), float(c[1] / img_h)
 
 
-# ── Convert MediaPipe coords to arm space ────────────────────────────────────────
-# MediaPipe:  X left/right (0=left, 1=right after flip)
-#             Y up/down    (0=top,  1=bottom)
-#             Z depth      (0=near, 1=far after normalisation)
-#
-# Arm space:  X left/right — same as MediaPipe X
-#             Y forward/back — MediaPipe Z, same direction
-#             Z up/down — MediaPipe Y flipped (0=top → 1=up in arm space)
-def to_arm_space(mp_x, mp_y, mp_z):
-    arm_x = mp_x           # left/right — unchanged
-    arm_y = mp_z           # forward/back — depth maps directly
-    arm_z = 1.0 - mp_y    # up/down — flip Y so up = larger value
-    return arm_x, arm_y, arm_z
+# ── Unproject screen coords + depth to real-world metres ─────────────────────────
+# Origin: centre of screen at 0.5m depth = (0, 0, 0)
+#   X: left/right  — negative left, positive right
+#   Y: depth       — 0 at camera, centred so 0.5m = 0.0
+#   Z: up/down     — negative down, positive up
+def unproject(norm_x, norm_y, depth_m):
+    cx = norm_x - 0.5   # centre: 0.5 screen → 0.0
+    cy = norm_y - 0.5   # centre: positive = down on screen
+
+    half_w = depth_m * np.tan(np.radians(CAM_FOV_H_DEG / 2))
+    half_h = depth_m * np.tan(np.radians(CAM_FOV_V_DEG / 2))
+
+    x_m =  cx * 2 * half_w    # left/right
+    y_m =  depth_m - 0.5      # forward/back centred at 0.5m
+    z_m = -cy * 2 * half_h    # up/down — flip so screen-down = negative
+
+    return x_m, y_m, z_m
 
 
 # ── EMA smoother ────────────────────────────────────────────────────────────────
@@ -167,7 +175,7 @@ def main():
         min_tracking_confidence=0.5,
     )
 
-    # Smoothers in arm space
+    # Smoothers in real-world metres
     ema_x = EMA(SMOOTH_ALPHA)
     ema_y = EMA(SMOOTH_ALPHA)
     ema_z = EMA(SMOOTH_ALPHA)
@@ -198,10 +206,10 @@ def main():
             if hand_visible:
                 lm = result.hand_landmarks[0]
 
-                # Raw MediaPipe coords
+                # Raw MediaPipe screen coords (normalised 0-1)
                 mp_x, mp_y = palm_center_norm(lm, w, h)
 
-                # Depth
+                # Depth estimation
                 raw_depth = estimate_depth(lm, w, h)
                 if raw_depth is not None:
                     depth_buf.append(raw_depth)
@@ -213,17 +221,16 @@ def main():
                     good = [v for v in vals if abs(v - med) < 0.15]
                     smoothed_depth = float(np.mean(good)) if good else med
 
-                mp_z = None
+                # Clamp depth to valid range
                 if smoothed_depth is not None:
-                    mp_z = (smoothed_depth - Z_NEAR) / (Z_FAR - Z_NEAR)
-                    mp_z = max(0.0, min(1.0, mp_z))
+                    smoothed_depth = max(DEPTH_MIN, min(DEPTH_MAX, smoothed_depth))
 
-                # Convert to arm space then smooth
-                if mp_z is not None:
-                    ax, ay, az = to_arm_space(mp_x, mp_y, mp_z)
-                    sx = ema_x.update(ax)
-                    sy = ema_y.update(ay)
-                    sz = ema_z.update(az)
+                # Unproject to real-world metres then smooth
+                if smoothed_depth is not None:
+                    x_m, y_m, z_m = unproject(mp_x, mp_y, smoothed_depth)
+                    sx = ema_x.update(x_m)
+                    sy = ema_y.update(y_m)
+                    sz = ema_z.update(z_m)
                 else:
                     sx = ema_x.update(None)
                     sy = ema_y.update(None)
@@ -258,7 +265,7 @@ def main():
                             send = True
 
                         if send:
-                            packet = f"{prefix}:{sx:.3f},{sy:.3f},{sz:.3f}\n"
+                            packet = f"{prefix}:{sx:.4f},{sy:.4f},{sz:.4f}\n"
                             if ser:
                                 ser.write(packet.encode())
                             else:
@@ -267,9 +274,8 @@ def main():
                             last_send_time = now
 
                 # HUD overlay
-                depth_str = f"{smoothed_depth:.2f}m" if smoothed_depth else "--"
                 cv2.putText(frame,
-                    f"[{prefix}] X:{sx:.3f}  Y:{sy:.3f}  Z:{sz:.3f}  depth:{depth_str}",
+                    f"[{prefix}] X:{sx:.3f}m  Y:{sy:.3f}m  Z:{sz:.3f}m",
                     (16, 40), font, 0.7, (0, 255, 180), 2)
                 cv2.putText(frame,
                     f"gesture: {gesture}",
@@ -281,20 +287,25 @@ def main():
                     bx2, by2 = int(lm[b].x * w), int(lm[b].y * h)
                     cv2.line(frame, (ax2, ay2), (bx2, by2), (0, 210, 210), 2)
 
+                pts = np.array([[lm[i].x * w, lm[i].y * h] for i in PALM_PTS])
+                cx, cy = pts.mean(axis=0).astype(int)
+
+                # Scale dot with depth
+                if smoothed_depth is not None:
+                    dot_radius = int(5 / smoothed_depth)
+                else:
+                    dot_radius = 8
+
+                cv2.circle(frame, (cx, cy), dot_radius, (0, 255, 0), -1)
+
             else:
-                # No hand — send hold
-                if last_sent is None or last_sent[3] != "F":
-                    packet = "F:0.500,0.500,0.500\n"
-                    if ser:
-                        ser.write(packet.encode())
-                    else:
-                        print(packet, end="")
-                    last_sent = (0.5, 0.5, 0.5, "F")
+                # No hand — send hold at origin (centre screen, 0.5m depth)
 
                 cv2.putText(frame, "No hand — holding", (16, 40),
                             font, 0.7, (80, 80, 80), 2)
                 depth_buf.clear()
                 gesture_buf.clear()
+                last_sent = None
 
             cv2.imshow("Hand Tracker", frame)
             if cv2.waitKey(1) & 0xFF in (ord('q'), 27):

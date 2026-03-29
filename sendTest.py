@@ -1,10 +1,6 @@
-import serial
-import time
+import cv2
 
-ser = serial.Serial('COM4', 115200)
-time.sleep(3)
-
-while True:
-    ser.write(b'HELLO\n')
-    print("Sent HELLO")
-    time.sleep(1)
+cap = cv2.VideoCapture(0)
+w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+print(f"Resolution: {w}x{h}, pixel aspect: {w/h:.4f}")

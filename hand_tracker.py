@@ -1,15 +1,24 @@
 """
 Hand Tracker → Arduino Serial
 ==============================
-Stripped from the window-control version.
-Sends filtered XYZ to Arduino at ~20Hz.
+Detects gesture and sends prefix + arm-space XYZ to Arduino.
 
-Serial format:  X:0.623,Y:0.441,Z:0.318\n
+Gesture mapping:
+    Closed_Fist  → N  (relative delta tracking)
+    Victory      → P  (absolute IK snap)
+    anything else → F  (hold)
+
+Coordinate convention (converted to arm space before sending):
+    Arm X = hand left/right       (MediaPipe X, same direction)
+    Arm Y = hand forward/back     (MediaPipe Z flipped: closer = more negative MP Z)
+    Arm Z = hand up/down          (MediaPipe Y flipped: MP Y=0 is top of frame)
+
+Serial format:  "N:0.623,0.441,0.318\n"
+                 ^ prefix
 
 Install:  pip install mediapipe opencv-python numpy pyserial
-Run:      python hand_tracker.py --port COM4
-          python hand_tracker.py --port /dev/ttyUSB0
-          python hand_tracker.py --no-serial     (debug, no Arduino needed)
+Run:      python hand_trackerupdt.py --port COM4
+          python hand_trackerupdt.py --no-serial
 """
 
 import cv2
@@ -18,9 +27,9 @@ import numpy as np
 import serial
 import time
 import argparse
-from collections import deque
+from collections import deque, Counter
 
-# ── MediaPipe setup ────────────────────────────────────────────────────────────
+# ── MediaPipe setup ─────────────────────────────────────────────────────────────
 BaseOptions              = mp.tasks.BaseOptions
 GestureRecognizer        = mp.tasks.vision.GestureRecognizer
 GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
@@ -28,7 +37,7 @@ VisionRunningMode        = mp.tasks.vision.RunningMode
 
 MODEL_PATH = "C:/Users/livel/VScode/246 Project/HandTracking/gesture_recognizer.task"
 
-# ── Landmark indices (kept from your original) ─────────────────────────────────
+# ── Landmark indices ─────────────────────────────────────────────────────────────
 WRIST      = 0
 INDEX_MCP  = 5
 MIDDLE_MCP = 9
@@ -43,30 +52,40 @@ PALM_PAIRS = [
     (WRIST,     PINKY_MCP,  0.065),
 ]
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Gesture → serial prefix ──────────────────────────────────────────────────────
+# Anything not listed here sends F (hold)
+GESTURE_PREFIX = {
+    "Closed_Fist": "N",   # relative delta tracking
+    "Victory":     "P",   # absolute IK snap
+}
+
+# ── Config ───────────────────────────────────────────────────────────────────────
 SERIAL_BAUD  = 115200
 SEND_HZ      = 20
 
-# Deadband: minimum change before sending an update.
-# Stops arm tremor when your hand is still. Tune 0.01–0.05.
-DEADBAND     = 0.02
+# EMA smoothing alpha per axis. Lower = smoother, laggier.
+SMOOTH_ALPHA = 0.10
 
-# EMA alpha. Lower = smoother, laggier. 0.1–0.4.
-SMOOTH_ALPHA = 0.25
+# Deadband — minimum change in any axis before sending.
+# Applied after coordinate conversion, in normalised 0-1 units.
+DEADBAND = 0.008
 
-# Z working range in metres.
-# Hand at Z_NEAR → Z output 0.0 (closest = fully retracted)
-# Hand at Z_FAR  → Z output 1.0 (furthest = fully extended)
-# Tune to your actual working distance from the camera.
-Z_NEAR = 0.25
-Z_FAR  = 0.80
+# Depth (Z) working range in metres.
+# Hand at Z_NEAR → normalised 0.0
+# Hand at Z_FAR  → normalised 1.0
+Z_NEAR = 0.0
+Z_FAR  = 1.0
+
+# Gesture smoothing — majority vote over this many frames
+# Prevents single-frame misdetections from switching modes
+GESTURE_BUF_LEN = 7
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
 
-# ── Depth estimation (unchanged from your original) ───────────────────────────
+# ── Depth estimation ─────────────────────────────────────────────────────────────
 def estimate_depth(lm, img_w, img_h):
-    focal = img_w / (2 * np.tan(np.radians(35)))
+    focal = img_w / (2 * np.tan(np.radians(31.5)))
     depths = []
     for a, b, real_m in PALM_PAIRS:
         px = np.hypot((lm[a].x - lm[b].x) * img_w,
@@ -80,14 +99,29 @@ def estimate_depth(lm, img_w, img_h):
     return float(np.mean(good)) if good else med
 
 
-# ── Palm centre normalised 0.0–1.0 ────────────────────────────────────────────
+# ── Palm centre, normalised 0-1 in MediaPipe frame ───────────────────────────────
 def palm_center_norm(lm, img_w, img_h):
     pts = np.array([[lm[i].x * img_w, lm[i].y * img_h] for i in PALM_PTS])
     c   = pts.mean(axis=0)
     return float(c[0] / img_w), float(c[1] / img_h)
 
 
-# ── Simple EMA ────────────────────────────────────────────────────────────────
+# ── Convert MediaPipe coords to arm space ────────────────────────────────────────
+# MediaPipe:  X left/right (0=left, 1=right after flip)
+#             Y up/down    (0=top,  1=bottom)
+#             Z depth      (0=near, 1=far after normalisation)
+#
+# Arm space:  X left/right — same as MediaPipe X
+#             Y forward/back — MediaPipe Z, same direction
+#             Z up/down — MediaPipe Y flipped (0=top → 1=up in arm space)
+def to_arm_space(mp_x, mp_y, mp_z):
+    arm_x = mp_x           # left/right — unchanged
+    arm_y = mp_z           # forward/back — depth maps directly
+    arm_z = 1.0 - mp_y    # up/down — flip Y so up = larger value
+    return arm_x, arm_y, arm_z
+
+
+# ── EMA smoother ────────────────────────────────────────────────────────────────
 class EMA:
     def __init__(self, alpha):
         self.alpha = alpha
@@ -103,7 +137,7 @@ class EMA:
         return self.value
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port",      default=None)
@@ -118,7 +152,7 @@ def main():
         time.sleep(2)
         print(f"Serial open on {args.port}")
     else:
-        print("No-serial debug mode — values printed to console")
+        print("No-serial debug mode")
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
@@ -127,16 +161,19 @@ def main():
     options = GestureRecognizerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=VisionRunningMode.VIDEO,
-        num_hands=1,                          # only need one hand
+        num_hands=1,
         min_hand_detection_confidence=0.6,
         min_hand_presence_confidence=0.6,
         min_tracking_confidence=0.5,
     )
 
-    ema_x     = EMA(SMOOTH_ALPHA)
-    ema_y     = EMA(SMOOTH_ALPHA)
-    ema_z     = EMA(SMOOTH_ALPHA)
-    depth_buf = deque(maxlen=8)
+    # Smoothers in arm space
+    ema_x = EMA(SMOOTH_ALPHA)
+    ema_y = EMA(SMOOTH_ALPHA)
+    ema_z = EMA(SMOOTH_ALPHA)
+
+    depth_buf   = deque(maxlen=8)
+    gesture_buf = deque(maxlen=GESTURE_BUF_LEN)
 
     last_sent      = None
     last_send_time = 0.0
@@ -161,10 +198,10 @@ def main():
             if hand_visible:
                 lm = result.hand_landmarks[0]
 
-                # X and Y: normalised 0–1 across the camera frame
-                raw_x, raw_y = palm_center_norm(lm, w, h)
+                # Raw MediaPipe coords
+                mp_x, mp_y = palm_center_norm(lm, w, h)
 
-                # Z: smooth depth then normalise to 0–1 within working range
+                # Depth
                 raw_depth = estimate_depth(lm, w, h)
                 if raw_depth is not None:
                     depth_buf.append(raw_depth)
@@ -176,53 +213,94 @@ def main():
                     good = [v for v in vals if abs(v - med) < 0.15]
                     smoothed_depth = float(np.mean(good)) if good else med
 
-                raw_z = None
+                mp_z = None
                 if smoothed_depth is not None:
-                    raw_z = (smoothed_depth - Z_NEAR) / (Z_FAR - Z_NEAR)
-                    raw_z = max(0.0, min(1.0, raw_z))
+                    mp_z = (smoothed_depth - Z_NEAR) / (Z_FAR - Z_NEAR)
+                    mp_z = max(0.0, min(1.0, mp_z))
 
-                # Smooth all three axes
-                sx = ema_x.update(raw_x)
-                sy = ema_y.update(raw_y)
-                sz = ema_z.update(raw_z)
+                # Convert to arm space then smooth
+                if mp_z is not None:
+                    ax, ay, az = to_arm_space(mp_x, mp_y, mp_z)
+                    sx = ema_x.update(ax)
+                    sy = ema_y.update(ay)
+                    sz = ema_z.update(az)
+                else:
+                    sx = ema_x.update(None)
+                    sy = ema_y.update(None)
+                    sz = ema_z.update(None)
 
+                # Gesture detection with majority-vote smoothing
+                raw_gesture = "None"
+                if result.gestures and result.gestures[0]:
+                    raw_gesture = result.gestures[0][0].category_name
+                gesture_buf.append(raw_gesture)
+                gesture = Counter(gesture_buf).most_common(1)[0][0]
+
+                # Map gesture to prefix — default to F (hold)
+                prefix = GESTURE_PREFIX.get(gesture, "F")
+
+                # Send packet
                 if None not in (sx, sy, sz):
                     if (now - last_send_time) >= send_interval:
 
-                        # Deadband: only send if something moved enough
+                        # Deadband — skip if nothing moved and not a mode change
                         send = True
                         if last_sent is not None:
-                            if (abs(sx - last_sent[0]) < DEADBAND and
-                                abs(sy - last_sent[1]) < DEADBAND and
-                                abs(sz - last_sent[2]) < DEADBAND):
+                            same_prefix = (prefix == last_sent[3])
+                            dx = abs(sx - last_sent[0])
+                            dy = abs(sy - last_sent[1])
+                            dz = abs(sz - last_sent[2])
+                            if same_prefix and dx < DEADBAND and dy < DEADBAND and dz < DEADBAND:
                                 send = False
 
+                        # Always send on prefix change so Arduino gets the mode switch immediately
+                        if last_sent is None or prefix != last_sent[3]:
+                            send = True
+
                         if send:
-                            packet = f"X:{sx:.3f},Y:{sy:.3f},Z:{sz:.3f}\n"
+                            packet = f"{prefix}:{sx:.3f},{sy:.3f},{sz:.3f}\n"
                             if ser:
                                 ser.write(packet.encode())
                             else:
                                 print(packet, end="")
-                            last_sent      = (sx, sy, sz)
+                            last_sent      = (sx, sy, sz, prefix)
                             last_send_time = now
 
-                # Overlay
+                # HUD overlay
                 depth_str = f"{smoothed_depth:.2f}m" if smoothed_depth else "--"
                 cv2.putText(frame,
-                    f"X:{sx:.3f}  Y:{sy:.3f}  Z:{sz:.3f}  depth:{depth_str}",
+                    f"[{prefix}] X:{sx:.3f}  Y:{sy:.3f}  Z:{sz:.3f}  depth:{depth_str}",
                     (16, 40), font, 0.7, (0, 255, 180), 2)
+                cv2.putText(frame,
+                    f"gesture: {gesture}",
+                    (16, 75), font, 0.6, (180, 180, 0), 2)
 
                 # Skeleton
                 for a, b in mp.solutions.hands.HAND_CONNECTIONS:
-                    ax, ay = int(lm[a].x * w), int(lm[a].y * h)
-                    bx, by = int(lm[b].x * w), int(lm[b].y * h)
-                    cv2.line(frame, (ax, ay), (bx, by), (0, 210, 210), 2)
+                    ax2, ay2 = int(lm[a].x * w), int(lm[a].y * h)
+                    bx2, by2 = int(lm[b].x * w), int(lm[b].y * h)
+                    cv2.line(frame, (ax2, ay2), (bx2, by2), (0, 210, 210), 2)
+
+                pts = np.array([[lm[i].x * w, lm[i].y * h] for i in PALM_PTS])
+                cx, cy = pts.mean(axis=0).astype(int)
+
+                # Scale dot with depth — larger when close, smaller when far
+                # smoothed_depth is in metres, Z_NEAR=close, Z_FAR=far
+                if smoothed_depth is not None:
+                    dot_radius = int(5/smoothed_depth)
+                else:
+                    dot_radius = 8
+                # dot_radius = max(4, min(dot_radius, 40))  # clamp so it doesn't get huge or tiny
+
+                cv2.circle(frame, (cx, cy), dot_radius, (0, 255, 0), -1)
 
             else:
-                cv2.putText(frame, "No hand", (16, 40), font, 0.7, (80, 80, 80), 2)
+                # No hand — send hold
+                cv2.putText(frame, "No hand — holding", (16, 40),
+                            font, 0.7, (80, 80, 80), 2)
                 depth_buf.clear()
-                # Don't clear EMA — if hand briefly disappears and returns,
-                # smoothers resume from last known position rather than snapping.
+                gesture_buf.clear()
+                last_sent = None
 
             cv2.imshow("Hand Tracker", frame)
             if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
