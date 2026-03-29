@@ -88,14 +88,34 @@ font = cv2.FONT_HERSHEY_SIMPLEX
 
 
 # ── Depth estimation ─────────────────────────────────────────────────────────────
-def estimate_depth(lm, img_w, img_h):
-    focal = img_w / (2 * np.tan(np.radians(31.5)))
+def estimate_depth_3d(lm_screen, lm_world, img_w, img_h):
+    """
+    Uses MediaPipe world landmarks (metric, hand-relative) to get
+    a pose-invariant real-world scale, then back-projects to depth.
+    """
+    focal = img_w / (2 * np.tan(np.radians(42)))
+    
     depths = []
-    for a, b, real_m in PALM_PAIRS:
-        px = np.hypot((lm[a].x - lm[b].x) * img_w,
-                      (lm[a].y - lm[b].y) * img_h)
+    for a, b, _ in PALM_PAIRS:   # ignore the hardcoded real_m
+        # Real-world distance from MediaPipe's own 3D estimate
+        wa = lm_world[a]
+        wb = lm_world[b]
+        real_m = np.sqrt(
+            (wa.x - wb.x)**2 +
+            (wa.y - wb.y)**2 +
+            (wa.z - wb.z)**2
+        )
+        if real_m < 0.005:   # skip degenerate pairs
+            continue
+
+        # Pixel distance on screen
+        px = np.hypot(
+            (lm_screen[a].x - lm_screen[b].x) * img_w,
+            (lm_screen[a].y - lm_screen[b].y) * img_h
+        )
         if px > 2:
             depths.append((focal * real_m) / px)
+
     if not depths:
         return None
     med  = np.median(depths)
@@ -204,13 +224,13 @@ def main():
             hand_visible = bool(result.hand_landmarks)
 
             if hand_visible:
-                lm = result.hand_landmarks[0]
+                # Screen landmarks (normalised)
+                lm_screen = result.hand_landmarks[0]
+                # World landmarks (metres, hand-relative)
+                lm_world  = result.hand_world_landmarks[0]
 
-                # Raw MediaPipe screen coords (normalised 0-1)
-                mp_x, mp_y = palm_center_norm(lm, w, h)
-
-                # Depth estimation
-                raw_depth = estimate_depth(lm, w, h)
+                mp_x, mp_y = palm_center_norm(lm_screen, w, h)
+                raw_depth   = estimate_depth_3d(lm_screen, lm_world, w, h)
                 if raw_depth is not None:
                     depth_buf.append(raw_depth)
 
@@ -283,11 +303,11 @@ def main():
 
                 # Skeleton
                 for a, b in mp.solutions.hands.HAND_CONNECTIONS:
-                    ax2, ay2 = int(lm[a].x * w), int(lm[a].y * h)
-                    bx2, by2 = int(lm[b].x * w), int(lm[b].y * h)
+                    ax2, ay2 = int(lm_screen[a].x * w), int(lm_screen[a].y * h)
+                    bx2, by2 = int(lm_screen[b].x * w), int(lm_screen[b].y * h)
                     cv2.line(frame, (ax2, ay2), (bx2, by2), (0, 210, 210), 2)
 
-                pts = np.array([[lm[i].x * w, lm[i].y * h] for i in PALM_PTS])
+                pts = np.array([[lm_screen[i].x * w, lm_screen[i].y * h] for i in PALM_PTS])
                 cx, cy = pts.mean(axis=0).astype(int)
 
                 # Scale dot with depth
