@@ -86,11 +86,11 @@ const float ELBOW_ZERO_OFFSET = 90.0;
 const long BASE_MIN_STEPS = -1930;
 const long BASE_MAX_STEPS = 965;
 
-const long SHOULDER_MIN_STEPS = -450;
-const long SHOULDER_MAX_STEPS = 450;
+const long SHOULDER_MIN_STEPS = -300;
+const long SHOULDER_MAX_STEPS = 300;
 
-const long ELBOW_MIN_STEPS = -2625;
-const long ELBOW_MAX_STEPS = 525;
+const long ELBOW_MIN_STEPS = -2450;
+const long ELBOW_MAX_STEPS = 350;
 
 // ============================================================
 // MOTION PARAMETERS
@@ -378,11 +378,11 @@ void handleHold()
 void handleAbsolute(float nx, float ny, float nz)
 {
 
-    // float armX = TIP_START_X + (nx - 0.5f) * SCALE_X;
-    // float armY = TIP_START_Y + (ny - 0.5f) * SCALE_Y;
-    // float armZ = TIP_START_Z + (nz - 0.5f) * SCALE_Z;
+    float armX = TIP_START_X + nx * SCALE_X;
+    float armY = TIP_START_Y + ny * SCALE_Y;
+    float armZ = TIP_START_Z + nz * SCALE_Z;
 
-    moveToXYZ(nx, ny, nz);
+    moveToXYZ(armX, armY, armZ);
 }
 
 // ============================================================
@@ -507,7 +507,7 @@ void loop()
                     handleHold();
                     break;
                 case 'P':
-                    handleAbsolute(x + 0.195f, y , z + 0.240f);
+                    handleAbsolute(x, y , z);
                     break;
                 default:
                     Serial.print("Unknown prefix: ");
