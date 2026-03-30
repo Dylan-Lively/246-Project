@@ -55,8 +55,8 @@ PALM_PAIRS = [
 # ── Gesture → serial prefix ──────────────────────────────────────────────────────
 # Anything not listed here sends F (hold)
 GESTURE_PREFIX = {
-    "Open_Palm": "N",   # relative delta tracking
-    "Victory":     "P",   # absolute IK snap
+    "Victory": "N",   # relative delta tracking
+    "Open_Palm": "P",   # absolute IK snap
     "ILoveYou": "M", # Mirror
 }
 
@@ -64,8 +64,8 @@ GESTURE_PREFIX = {
 # Measured: at 0.5m depth frame was 0.80m wide, 0.46m tall
 # FOV_H = 2 * atan(0.40 / 0.50) = 77.3°
 # FOV_V = 2 * atan(0.23 / 0.50) = 49.8°
-CAM_FOV_H_DEG = 77.3
-CAM_FOV_V_DEG = 49.8
+CAM_FOV_H_DEG = 79
+CAM_FOV_V_DEG = 51.3
 
 # ── Depth clamp (metres) ──────────────────────────────────────────────────────
 # Hand tracking disappears below ~0.20m so floor at 0.10m
