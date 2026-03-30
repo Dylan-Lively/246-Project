@@ -61,7 +61,7 @@ const float SCALE_Z = 1.0;
 
 // Delta threshold — normalised units treated as stillness.
 // Prevents arm tremor from hand noise. Tune 0.005 to 0.02.
-const float DELTA_THRESHOLD = 0.008;
+const float DELTA_THRESHOLD = 0.000;
 
 // ============================================================
 // MOTOR AND DRIVE
@@ -95,14 +95,14 @@ const long ELBOW_MAX_STEPS = 350;
 // ============================================================
 // MOTION PARAMETERS
 // ============================================================
-const float BASE_MAX_SPEED = 400.0;
-const float BASE_ACCEL = 200.0;
+const float BASE_MAX_SPEED = 1000.0;
+const float BASE_ACCEL = 500.0;
 
-const float SHOULDER_MAX_SPEED = 300.0;
-const float SHOULDER_ACCEL = 150.0;
+const float SHOULDER_MAX_SPEED = 500.0;
+const float SHOULDER_ACCEL = 250.0;
 
-const float ELBOW_MAX_SPEED = 300.0;
-const float ELBOW_ACCEL = 150.0;
+const float ELBOW_MAX_SPEED = 500.0;
+const float ELBOW_ACCEL = 250.0;
 
 // ============================================================
 // SERIAL
@@ -139,6 +139,10 @@ float prevNX = 0.195;
 float prevNY = 0.0;
 float prevNZ = 0.240;
 
+float pendingBase     = 0.0f;
+float pendingShoulder = 0.0f;
+float pendingElbow    = 0.0f;
+
 // ============================================================
 // STATE
 // ============================================================
@@ -157,10 +161,19 @@ int serialBufIdx = 0;
 // UTILITIES
 // ============================================================
 
+long clampL(long val, long lo, long hi)
+{
+    if (val < lo)
+        return lo;
+    if (val > hi)
+        return hi;
+    return val;
+}
+
 long angleToStepsSafe(float angleDeg, float zeroOffsetDeg, float stepsPerDeg,
                       long minSteps, long maxSteps)
 {
-    return (long)roundf((angleDeg - zeroOffsetDeg) * stepsPerDeg);
+    return clampL((long)roundf((angleDeg - zeroOffsetDeg) * stepsPerDeg), minSteps, maxSteps);
 }
 
 bool angleInRange(float angleDeg, float zeroOffsetDeg, float stepsPerDeg,
@@ -271,18 +284,20 @@ void moveToXYZ(float px, float py, float pz)
         Serial.println(pz, 3);
         return;
     }
-    else if (!angleInRange(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS)    ||
-             !angleInRange(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS) ||
-             !angleInRange(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS))
-    {
-      Serial.print("Out of bounds and unreachable: ");
-      Serial.print(px, 3);
-      Serial.print(" ");
-      Serial.print(py, 3);
-      Serial.print(" ");
-      Serial.println(pz, 3);
-      return;
-    }
+    // else if (!angleInRange(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS)    ||
+    //          !angleInRange(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS) ||
+    //          !angleInRange(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS))
+    // {
+    //   Serial.print("Out of bounds and unreachable: ");
+    //   Serial.print(px, 3);
+    //   Serial.print(" ");
+    //   Serial.print(py, 3);
+    //   Serial.print(" ");
+    //   Serial.println(pz, 3);
+    //   return;
+    // }
+
+
 
     long baseSteps     = angleToStepsSafe(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS);
     long shoulderSteps = angleToStepsSafe(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
@@ -327,6 +342,9 @@ void handleRelative(float nx, float ny, float nz)
 {
     if (!prevInitialised)
     {
+        pendingBase     = 0.0f;
+        pendingShoulder = 0.0f;
+        pendingElbow    = 0.0f;
         return;
     }
 
@@ -351,7 +369,77 @@ void handleRelative(float nx, float ny, float nz)
     if (fabs(armDZ) < DELTA_THRESHOLD * SCALE_Z)
         armDZ = 0.0f;
 
-    moveToXYZ(tipX + armDX, tipY + armDY, tipZ + armDZ);
+    float newX = tipX + armDX;
+    float newY = tipY + armDY;
+    float newZ = tipZ + armDZ;
+
+    float baseAng, shoulderAng, elbowAng;
+
+    if (!solveIK(newX, newY, newZ, baseAng, shoulderAng, elbowAng))
+    {
+        Serial.print("IK unreachable: ");
+        Serial.print(newX, 3);
+        Serial.print(" ");
+        Serial.print(newY, 3);
+        Serial.print(" ");
+        Serial.println(newZ, 3);
+        return;
+    }
+    // else if (!angleInRange(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS)    ||
+    //          !angleInRange(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS) ||
+    //          !angleInRange(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS))
+    // {
+    //   Serial.print("Out of bounds and unreachable: ");
+    //   Serial.print(px, 3);
+    //   Serial.print(" ");
+    //   Serial.print(py, 3);
+    //   Serial.print(" ");
+    //   Serial.println(pz, 3);
+    //   return;
+    // }
+
+    long baseSteps     = angleToStepsSafe(baseAng,     BASE_ZERO_OFFSET,     SPD_BASE,     BASE_MIN_STEPS,     BASE_MAX_STEPS);
+    long shoulderSteps = angleToStepsSafe(shoulderAng, SHOULDER_ZERO_OFFSET, SPD_SHOULDER, SHOULDER_MIN_STEPS, SHOULDER_MAX_STEPS);
+    long elbowSteps    = angleToStepsSafe(elbowAng,    ELBOW_ZERO_OFFSET,    SPD_ELBOW,    ELBOW_MIN_STEPS,    ELBOW_MAX_STEPS);
+
+    pendingBase     += baseSteps - base.targetPosition();
+    pendingShoulder += shoulderSteps - shoulder.targetPosition();
+    pendingElbow    += elbowSteps - elbow.targetPosition();
+
+    long baseMove     = (long)pendingBase;
+    long shoulderMove = (long)pendingShoulder;
+    long elbowMove    = (long)pendingElbow;
+
+    pendingBase     -= baseMove;
+    pendingShoulder -= shoulderMove;
+    pendingElbow    -= elbowMove;
+
+    base.moveTo(base.targetPosition()         + baseMove);
+    shoulder.moveTo(shoulder.targetPosition() + shoulderMove);
+    elbow.moveTo(elbow.targetPosition()       + elbowMove);
+
+    float baseRad     = (base.targetPosition() / SPD_BASE     + BASE_ZERO_OFFSET)     * PI / 180.0f;
+    float shoulderRad = (shoulder.targetPosition() / SPD_SHOULDER + SHOULDER_ZERO_OFFSET) * PI / 180.0f;
+    float elbowRad    = (elbow.targetPosition() / SPD_ELBOW    + ELBOW_ZERO_OFFSET)    * PI / 180.0f;
+
+    float r = L1 * cos(shoulderRad) + L2 * cos(shoulderRad - elbowRad);
+    tipX = r * cos(baseRad);
+    tipY = r * sin(baseRad);
+    tipZ = BASE_HEIGHT + L1 * sin(shoulderRad) + L2 * sin(shoulderRad - elbowRad);
+
+    // Debug — comment out once verified
+    Serial.print("ang ");
+    Serial.print(baseAng, 1);
+    Serial.print(" ");
+    Serial.print(shoulderAng, 1);
+    Serial.print(" ");
+    Serial.println(elbowAng, 1);
+    Serial.print("stp ");
+    Serial.print(baseSteps);
+    Serial.print(" ");
+    Serial.print(shoulderSteps);
+    Serial.print(" ");
+    Serial.println(elbowSteps);
 }
 
 // F — hold position
@@ -505,25 +593,28 @@ void loop()
                 {
                 case 'N':
                     handleRelative(x, y, z);
+                    prevInitialised = true;
+                    prevNX = x;
+                    prevNY = y;
+                    prevNZ = z;
                     break;
                 case 'F':
                     handleHold();
+                    prevInitialised = false;
                     break;
                 case 'P':
                     handleAbsolute(x, y , z);
+                    prevInitialised = false;
                     break;
                 case 'M':
                     handleMirror(x, y, z);
+                    prevInitialised = false;
                     break;
                 default:
                     Serial.print("Unknown prefix: ");
                     Serial.println(prefix);
                     break;
                 }
-                prevInitialised = true;
-                prevNX = x;
-                prevNY = y;
-                prevNZ = z;
             }
         }
         else

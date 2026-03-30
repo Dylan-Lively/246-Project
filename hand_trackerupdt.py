@@ -55,9 +55,9 @@ PALM_PAIRS = [
 # ── Gesture → serial prefix ──────────────────────────────────────────────────────
 # Anything not listed here sends F (hold)
 GESTURE_PREFIX = {
-    "Closed_Fist": "N",   # relative delta tracking
+    "Open_Palm": "N",   # relative delta tracking
     "Victory":     "P",   # absolute IK snap
-    "ILoveYou": "M",
+    "ILoveYou": "M", # Mirror
 }
 
 # ── Camera intrinsics ─────────────────────────────────────────────────────────
@@ -287,10 +287,9 @@ def main():
 
                         if send:
                             packet = f"{prefix}:{sx:.4f},{sy:.4f},{sz:.4f}\n"
+                            print(packet, end="")
                             if ser:
                                 ser.write(packet.encode())
-                            else:
-                                print(packet, end="")
                             last_sent      = (sx, sy, sz, prefix)
                             last_send_time = now
 
