@@ -1,34 +1,29 @@
 """
 Hand Tracker → Arduino Serial  (Raspberry Pi / Bookworm edition)
 =================================================================
-Uses picamera2 instead of cv2.VideoCapture — required on Raspberry Pi OS
-Bookworm because the old V4L2 camera stack was replaced by libcamera.
+Detects gesture and sends prefix + real-world XYZ metres to Arduino.
 
-Detects gesture and sends prefix + arm-space XYZ to Arduino.
+Coordinate system (origin = centre of screen at 0.5m depth):
+    X: left/right  (negative = left,  positive = right)
+    Y: depth       (positive = closer to camera)
+    Z: up/down     (negative = down,  positive = up)
 
 Gesture mapping:
-    Closed_Fist  → N  (relative delta tracking)
-    Victory      → P  (absolute IK snap)
+    Victory      → N  (relative delta tracking)
+    Open_Palm    → P  (absolute IK snap)
+    ILoveYou     → M  (mirror)
     anything else → F  (hold)
 
-Coordinate convention (converted to arm space before sending):
-    Arm X = hand left/right       (MediaPipe X, same direction)
-    Arm Y = hand forward/back     (MediaPipe Z depth estimate)
-    Arm Z = hand up/down          (MediaPipe Y flipped)
+Serial format:  "N:0.1230,-0.0420,0.0318\n"
 
-Serial format:  "N:0.623,0.441,0.318\n"
-
-Install (run these on the Pi):
+Install:
     sudo apt install -y python3-picamera2
     pip install mediapipe opencv-python numpy pyserial --break-system-packages
-
-    # Download the gesture recognizer model:
     wget -O gesture_recognizer.task \
       https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task
 
 Run:
     python hand_tracker_pi.py --port /dev/ttyUSB0
-    python hand_tracker_pi.py --port /dev/ttyACM0
     python hand_tracker_pi.py --no-serial
 """
 
@@ -38,8 +33,6 @@ import numpy as np
 import time
 import argparse
 from collections import deque, Counter
-
-# picamera2 — installed via apt on Bookworm, not pip
 from picamera2 import Picamera2
 
 try:
@@ -55,7 +48,6 @@ GestureRecognizer        = mp.tasks.vision.GestureRecognizer
 GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
 VisionRunningMode        = mp.tasks.vision.RunningMode
 
-# Put the .task file in the same directory as this script, or give a full path
 MODEL_PATH = "gesture_recognizer.task"
 
 # ── Landmark indices ─────────────────────────────────────────────────────────
@@ -75,36 +67,49 @@ PALM_PAIRS = [
 
 # ── Gesture → serial prefix ──────────────────────────────────────────────────
 GESTURE_PREFIX = {
-    "Closed_Fist": "N",
-    "Victory":     "P",
+    "Victory":   "N",
+    "Open_Palm": "P",
+    "ILoveYou":  "M",
 }
 
+# ── Camera intrinsics ────────────────────────────────────────────────────────
+CAM_FOV_H_DEG = 79
+CAM_FOV_V_DEG = 51.3
+
+# ── Depth clamp (metres) ─────────────────────────────────────────────────────
+DEPTH_MIN = 0.10
+DEPTH_MAX = 1.00
+
 # ── Config ───────────────────────────────────────────────────────────────────
-SERIAL_BAUD  = 115200
-SEND_HZ      = 20
-
-# Camera resolution — Camera Module 3 native is 4608x2592 but that's too slow
-# for MediaPipe. 1280x720 is a good balance on Pi 4/5.
-# Drop to 640x480 on Pi 3 or if fps is low.
-CAM_W = 1280
-CAM_H = 720
-
+SERIAL_BAUD     = 115200
+SEND_HZ         = 20
+CAM_W           = 1280
+CAM_H           = 720
 SMOOTH_ALPHA    = 0.25
-DEADBAND        = 0.008
-Z_NEAR          = 0.25
-Z_FAR           = 0.80
+DEADBAND        = 0.005
 GESTURE_BUF_LEN = 7
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
 
 # ── Depth estimation ─────────────────────────────────────────────────────────
-def estimate_depth(lm, img_w, img_h):
-    focal = img_w / (2 * np.tan(np.radians(35)))
+def estimate_depth_3d(lm_screen, lm_world, img_w, img_h):
+    focal = img_w / (2 * np.tan(np.radians(42)))
     depths = []
-    for a, b, real_m in PALM_PAIRS:
-        px = np.hypot((lm[a].x - lm[b].x) * img_w,
-                      (lm[a].y - lm[b].y) * img_h)
+    for a, b, _ in PALM_PAIRS:
+        wa = lm_world[a]
+        wb = lm_world[b]
+        real_m = np.sqrt(
+            (wa.x - wb.x)**2 +
+            (wa.y - wb.y)**2 +
+            (wa.z - wb.z)**2
+        )
+        if real_m < 0.005:
+            continue
+        px = np.hypot(
+            (lm_screen[a].x - lm_screen[b].x) * img_w,
+            (lm_screen[a].y - lm_screen[b].y) * img_h
+        )
         if px > 2:
             depths.append((focal * real_m) / px)
     if not depths:
@@ -121,12 +126,19 @@ def palm_center_norm(lm, img_w, img_h):
     return float(c[0] / img_w), float(c[1] / img_h)
 
 
-# ── MediaPipe → arm space ────────────────────────────────────────────────────
-def to_arm_space(mp_x, mp_y, mp_z):
-    arm_x = mp_x
-    arm_y = mp_z
-    arm_z = 1.0 - mp_y
-    return arm_x, arm_y, arm_z
+# ── Unproject screen coords + depth to real-world metres ─────────────────────
+def unproject(norm_x, norm_y, depth_m):
+    cx = norm_x - 0.5
+    cy = norm_y - 0.5
+
+    half_w = depth_m * np.tan(np.radians(CAM_FOV_H_DEG / 2))
+    half_h = depth_m * np.tan(np.radians(CAM_FOV_V_DEG / 2))
+
+    x_m =  cx * 2 * half_w
+    y_m =  0.5 - depth_m
+    z_m = -cy * 2 * half_h
+
+    return x_m, y_m, z_m
 
 
 # ── EMA smoother ─────────────────────────────────────────────────────────────
@@ -147,24 +159,13 @@ class EMA:
 
 # ── picamera2 capture ────────────────────────────────────────────────────────
 def make_camera():
-    """
-    Configure picamera2 for video capture.
-    Returns a started Picamera2 instance that produces BGR frames
-    compatible with OpenCV.
-    """
     cam = Picamera2()
-
-    # Use the main stream at our chosen resolution.
-    # format="BGR888" gives us OpenCV-compatible frames directly —
-    # no colour conversion needed.
     config = cam.create_video_configuration(
         main={"size": (CAM_W, CAM_H), "format": "BGR888"},
         controls={"FrameRate": 30},
     )
     cam.configure(config)
     cam.start()
-
-    # Let AGC/AWB settle before we start processing
     time.sleep(1.0)
     return cam
 
@@ -172,12 +173,10 @@ def make_camera():
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port",      default=None,
-                        help="Serial port, e.g. /dev/ttyUSB0 or /dev/ttyACM0")
+    parser.add_argument("--port",      default=None)
     parser.add_argument("--no-serial", action="store_true")
     args = parser.parse_args()
 
-    # Serial setup
     ser = None
     if not args.no_serial:
         if not SERIAL_AVAILABLE:
@@ -192,12 +191,10 @@ def main():
     else:
         print("No-serial debug mode")
 
-    # Camera setup — picamera2 instead of cv2.VideoCapture
     print("Starting camera...")
     cam = make_camera()
     print(f"Camera running at {CAM_W}x{CAM_H}")
 
-    # MediaPipe gesture recognizer
     options = GestureRecognizerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=VisionRunningMode.VIDEO,
@@ -218,32 +215,20 @@ def main():
     last_send_time = 0.0
     send_interval  = 1.0 / SEND_HZ
 
-    # FPS counter
     fps_buf  = deque(maxlen=30)
     fps_last = time.time()
 
     with GestureRecognizer.create_from_options(options) as recognizer:
         while True:
-            # ── Grab frame from picamera2 ──────────────────────────────────
-            # capture_array() returns a numpy array in the format we configured
-            # (BGR888 → shape HxWx3, dtype uint8) — identical to what
-            # cv2.VideoCapture.read() gives you.
             frame = cam.capture_array()
-
-            # Pi camera is not mirrored by default — flip so left/right
-            # matches the user's perspective (same as the original code).
             frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+            now   = time.time()
 
-            h, w = frame.shape[:2]
-            now  = time.time()
-
-            # FPS
             fps_buf.append(now - fps_last)
             fps_last = now
             fps = 1.0 / (sum(fps_buf) / len(fps_buf)) if fps_buf else 0.0
 
-            # ── MediaPipe ─────────────────────────────────────────────────
-            # MediaPipe expects RGB — convert from BGR
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = recognizer.recognize_for_video(mp_img, int(now * 1000))
@@ -251,11 +236,11 @@ def main():
             hand_visible = bool(result.hand_landmarks)
 
             if hand_visible:
-                lm = result.hand_landmarks[0]
+                lm_screen = result.hand_landmarks[0]
+                lm_world  = result.hand_world_landmarks[0]
 
-                mp_x, mp_y = palm_center_norm(lm, w, h)
-
-                raw_depth = estimate_depth(lm, w, h)
+                mp_x, mp_y = palm_center_norm(lm_screen, w, h)
+                raw_depth  = estimate_depth_3d(lm_screen, lm_world, w, h)
                 if raw_depth is not None:
                     depth_buf.append(raw_depth)
 
@@ -266,16 +251,14 @@ def main():
                     good = [v for v in vals if abs(v - med) < 0.15]
                     smoothed_depth = float(np.mean(good)) if good else med
 
-                mp_z = None
                 if smoothed_depth is not None:
-                    mp_z = (smoothed_depth - Z_NEAR) / (Z_FAR - Z_NEAR)
-                    mp_z = max(0.0, min(1.0, mp_z))
+                    smoothed_depth = max(DEPTH_MIN, min(DEPTH_MAX, smoothed_depth))
 
-                if mp_z is not None:
-                    ax, ay, az = to_arm_space(mp_x, mp_y, mp_z)
-                    sx = ema_x.update(ax)
-                    sy = ema_y.update(ay)
-                    sz = ema_z.update(az)
+                if smoothed_depth is not None:
+                    x_m, y_m, z_m = unproject(mp_x, mp_y, smoothed_depth)
+                    sx = ema_x.update(x_m)
+                    sy = ema_y.update(y_m)
+                    sz = ema_z.update(z_m)
                 else:
                     sx = ema_x.update(None)
                     sy = ema_y.update(None)
@@ -304,52 +287,42 @@ def main():
                             send = True
 
                         if send:
-                            packet = f"{prefix}:{sx:.3f},{sy:.3f},{sz:.3f}\n"
+                            packet = f"{prefix}:{sx:.4f},{sy:.4f},{sz:.4f}\n"
+                            print(packet, end="")
                             if ser:
                                 ser.write(packet.encode())
-                            else:
-                                print(packet, end="")
                             last_sent      = (sx, sy, sz, prefix)
                             last_send_time = now
 
-                # HUD overlay
-                depth_str = f"{smoothed_depth:.2f}m" if smoothed_depth else "--"
                 cv2.putText(frame,
-                    f"[{prefix}] X:{sx:.3f}  Y:{sy:.3f}  Z:{sz:.3f}  depth:{depth_str}",
+                    f"[{prefix}] X:{sx:.3f}m  Y:{sy:.3f}m  Z:{sz:.3f}m",
                     (16, 40), font, 0.7, (0, 255, 180), 2)
                 cv2.putText(frame,
                     f"gesture: {gesture}",
                     (16, 75), font, 0.6, (180, 180, 0), 2)
 
-                # Skeleton
                 for a, b in mp.solutions.hands.HAND_CONNECTIONS:
-                    ax2, ay2 = int(lm[a].x * w), int(lm[a].y * h)
-                    bx2, by2 = int(lm[b].x * w), int(lm[b].y * h)
+                    ax2, ay2 = int(lm_screen[a].x * w), int(lm_screen[a].y * h)
+                    bx2, by2 = int(lm_screen[b].x * w), int(lm_screen[b].y * h)
                     cv2.line(frame, (ax2, ay2), (bx2, by2), (0, 210, 210), 2)
 
-            else:
-                if last_sent is None or last_sent[3] != "F":
-                    packet = "F:0.500,0.500,0.500\n"
-                    if ser:
-                        ser.write(packet.encode())
-                    else:
-                        print(packet, end="")
-                    last_sent = (0.5, 0.5, 0.5, "F")
+                pts = np.array([[lm_screen[i].x * w, lm_screen[i].y * h] for i in PALM_PTS])
+                cx2, cy2 = pts.mean(axis=0).astype(int)
+                dot_radius = int(5 / smoothed_depth) if smoothed_depth else 8
+                cv2.circle(frame, (cx2, cy2), dot_radius, (0, 255, 0), -1)
 
+            else:
                 cv2.putText(frame, "No hand — holding", (16, 40),
                             font, 0.7, (80, 80, 80), 2)
                 depth_buf.clear()
                 gesture_buf.clear()
+                last_sent = None
 
-            # FPS display
             cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 30),
                         font, 0.6, (200, 200, 200), 2)
 
             cv2.imshow("Hand Tracker", frame)
-
-            # 'q' or ESC to quit
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), 27):
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                 break
 
     cam.stop()
