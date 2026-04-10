@@ -333,7 +333,7 @@ def main():
             draw_panel(frame, panel_x, panel_y, panel_w, panel_h, color, alpha=0.12)
 
             # Project name
-            cv2.putText(frame, "TRACTUS", (panel_x+10, panel_y+22),
+            cv2.putText(frame, "TRACE", (panel_x+10, panel_y+22),
                         font, 0.55, color, 1, cv2.LINE_AA)
             cv2.line(frame, (panel_x+10, panel_y+28),
                      (panel_x+panel_w-10, panel_y+28), color, 1)
@@ -378,7 +378,7 @@ def main():
                 cv2.putText(frame, pkt_str, (22, h-17),
                             font_mono, 1.1, color, 1, cv2.LINE_AA)
 
-            cv2.imshow("Tractus", frame)
+            cv2.imshow("Trace", frame)
             if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                 break
 
